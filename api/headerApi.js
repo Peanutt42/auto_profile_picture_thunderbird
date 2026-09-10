@@ -136,6 +136,9 @@ const DATA_URL_REGEX = /^data:([^;,]+)(;base64)?,(.*)$/;
 const ROW_AVATAR_REFERENCE = Symbol("autoProfilePictureRowAvatar");
 const RECIPIENT_AVATAR_OWNER = "auto-profile-picture";
 const EXTENSION_AVATAR_SELECTOR = `.recipient-avatar[data-auto-profile-picture-owner="${RECIPIENT_AVATAR_OWNER}"]`;
+const MAX_INSTA_CACHE_SIZE = 10000;
+const instaAvatarCache = new Map();
+const permanentAvatarObservers = new WeakMap();
 
 function hasInitialsValue(value) {
   return typeof value === "string" && value.includes(INITIALS_PREFIX);
@@ -216,6 +219,196 @@ function cleanupDuplicateRecipientAvatars(container, keepAvatar = null) {
       avatar.remove();
     }
   }
+}
+
+/**
+ * Gets the display name shown in the row's sender cell.
+ *
+ * @param {HTMLElement} row - The row element.
+ * @returns {string} - The sender name, or an empty string.
+ */
+function getRowSenderName(row) {
+  const el =
+    row &&
+    (row.querySelector('.sender') || row.querySelector('.correspondentcol-column'));
+  return (el && el.textContent || '').trim();
+}
+
+/**
+ * Stores an avatar payload keyed by sender name so it can be reapplied
+ * instantly when Thunderbird rebuilds rows (e.g. after a folder switch).
+ *
+ * @param {string} senderName - The display name of the sender.
+ * @param {Object} payload - The avatar payload.
+ */
+function cacheRowAvatar(senderName, payload) {
+  if (!payload || payload.type === 'empty' || !senderName) {
+    return;
+  }
+  instaAvatarCache.set(senderName.toLowerCase(), payload);
+  while (instaAvatarCache.size > MAX_INSTA_CACHE_SIZE) {
+    const oldest = instaAvatarCache.keys().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    instaAvatarCache.delete(oldest);
+  }
+}
+
+/**
+ * Returns the cached avatar payload for the given sender name, or null.
+ *
+ * @param {string} senderName - The display name of the sender.
+ * @returns {?Object} - The cached payload.
+ */
+function getCachedAvatar(senderName) {
+  if (!senderName) {
+    return null;
+  }
+  return instaAvatarCache.get(senderName.toLowerCase()) || null;
+}
+
+/**
+ * Instantly reapplies a cached avatar (if any) to the given row.
+ *
+ * @param {HTMLElement} row - The row element.
+ * @param {Document} document - The document object.
+ * @returns {Promise<void>}
+ */
+async function applyCachedAvatarToRow(row, document) {
+  if (!row || !row.isConnected || !document) {
+    return;
+  }
+  const senderName = getRowSenderName(row);
+  const payload = senderName ? getCachedAvatar(senderName) : null;
+  if (payload) {
+    await installOnRow(document, payload, row, false);
+    return;
+  }
+  const avatar = getExtensionRecipientAvatar(row);
+  if (!avatar || !avatar.dataset.autoProfilePictureSenderName) {
+    return;
+  }
+  const stored = avatar.dataset.autoProfilePictureSenderName.toLowerCase();
+  if (senderName && senderName.toLowerCase() === stored) {
+    return;
+  }
+  // Only remove the avatar when the row positively shows a *different*
+  // sender: non-empty DOM text that disagrees with the stored one. While a
+  // row is mid-transition (empty text) the correct avatar would just have
+  // been installed by the first background pass, and removing it here causes
+  // the flicker the throttled second pass then "permanently" fixes.
+  if (!senderName) {
+    return;
+  }
+  removeAvatarFromRow(row);
+}
+
+/**
+ * Installs a permanent observer on the thread tree that reapplies cached
+ * avatars as soon as rows are (re)created or refilled, so profile icons stay
+ * visible without flashing when Thunderbird rebuilds the list.
+ *
+ * @param {Object} window - The window object.
+ */
+function initPermanentAvatarObserver(window) {
+  const { document } = window;
+  const threadTree = document.getElementById('threadTree');
+  if (!threadTree || permanentAvatarObservers.has(document)) {
+    return;
+  }
+  permanentAvatarObservers.set(document, true);
+
+  const isTextNode = (node) =>
+    !!node && node.nodeType === (window.Node && window.Node.TEXT_NODE);
+
+  const resolveRow = (node) => {
+    if (!node) {
+      return null;
+    }
+    const el = isTextNode(node) ? node.parentNode : node;
+    if (!(el instanceof window.HTMLElement)) {
+      return null;
+    }
+    if ((el.tagName || '').toUpperCase() === 'TR') {
+      return el;
+    }
+    return el.closest ? el.closest('tr, TR') : null;
+  };
+
+  const isRelevantRow = (row) =>
+    !!row &&
+    row.isConnected &&
+    row.closest('#threadTree') === threadTree &&
+    (row.tagName || '').toUpperCase() === 'TR' &&
+    row.getAttribute('data-properties') !== 'dummy';
+
+  // Applies synchronously, so the icon is written into the DOM in the same
+  // task that created or refilled the row — never a frame behind.
+  const applyToRow = (row) => {
+    try {
+      applyCachedAvatarToRow(row, document);
+    } catch (error) {
+      console.error('auto-profile-picture: applyCachedAvatarToRow', error);
+    }
+  };
+
+  const requestHealAllRows = () => {
+    const rows = threadTree._rows;
+    if (!rows) {
+      return;
+    }
+    for (const row of rows.values()) {
+      try {
+        if (isRelevantRow(row)) {
+          applyToRow(row);
+        }
+      } catch (error) {
+        console.error('auto-profile-picture: heal', error);
+      }
+    }
+  };
+
+  const observer = new window.MutationObserver((mutations) => {
+    const rowsSeen = new Set();
+    for (const mutation of mutations) {
+      let nodesToCheck = null;
+      if (mutation.type === 'childList') {
+        nodesToCheck = mutation.addedNodes;
+      } else if (mutation.type === 'characterData') {
+        nodesToCheck = [mutation.target.parentNode];
+      }
+      if (!nodesToCheck) {
+        continue;
+      }
+      for (const node of nodesToCheck) {
+        if (!node) {
+          continue;
+        }
+        const row = resolveRow(node);
+        if (!isRelevantRow(row) || rowsSeen.has(row)) {
+          continue;
+        }
+        rowsSeen.add(row);
+        applyToRow(row);
+      }
+    }
+  });
+
+  observer.observe(threadTree, {
+    childList: true,
+    subtree: true,
+    characterData: true,
+  });
+
+  threadTree.addEventListener('viewchange', () => {
+    // Heal rows that are already connected right now, and again on the next
+    // frame for rows the tree is still (re)connecting after the event. This
+    // restores avatars immediately after a rebuild instead of waiting for the
+    // next background pass (~a second later).
+    requestHealAllRows();
+    window.requestAnimationFrame(() => requestHealAllRows());
+  });
 }
 
 function mountRecipientAvatar(row, avatar) {
@@ -745,6 +938,7 @@ function installCss(window) {
     align-items: center;
     justify-content: center;
     display:inline-flex;
+    flex-shrink: 0;
     vertical-align: middle;
     margin-inline-end: 1px;
     color: light-dark(#71717a, #a1a1aa);
@@ -781,11 +975,37 @@ function installCss(window) {
   .card-container > .thread-card-column:first-child:not(:has(.recipient-avatar)) {
     margin-right: calc(var(--recipient-avatar-size) + var(--placeholder-margin));
   }
+  /* TB 154+ caps the first card column at --read-status-size (16px, 12px
+     compact) which squeezes profile avatars down to that tiny size. Restore
+     the auto-sized column when one of our avatars is present. */
+  .card-container:has(.recipient-avatar) > .thread-card-column:first-child {
+    inline-size: auto !important;
+    block-size: auto !important;
+  }
+  /* Pre-154 Thunderbird always laid out the read-status icon in the first
+     card column (transparent fill when read). That 16px icon + column gap is
+     what offset the avatar from the left card edge. TB 154+ hides it with
+     display:none, cramping the avatar into the corner, so restore the
+     laid-out (still transparent when read) icon in rows with our avatar. */
+  .card-container:has(.recipient-avatar) .read-status {
+    display: inline-block !important;
+  }
+  /* Nudge the card avatar down a few pixels so it sits visually centered
+     against the sender + subject lines. */
+  .card-container .recipient-avatar {
+    margin-top: 5px;
+  }
   .table-layout {
     --recipient-avatar-size: 15px;
     --top-position: calc(50% - 7.5px);
   }
   .table-layout[style="height: 30px;"] {
+    --recipient-avatar-size: 20px;
+    --top-position: calc(50% - 10px);
+  }
+  /* Current Thunderbird (139+) table rows are 22px tall (ThreadRow.ROW_HEIGHT),
+     so apply the compact 20px avatar sizing to them directly. */
+  .table-layout[style="height: 22px;"] {
     --recipient-avatar-size: 20px;
     --top-position: calc(50% - 10px);
   }
@@ -848,7 +1068,18 @@ async function installOnRow(document, urlOrObj, row, temporary) {
   const initialsColor = normalizedPayload.color;
   const identifier = normalizedPayload.identifier || null;
   const payloadType = determinePayloadType(url);
-  let didUpdate = false;
+
+  const senderName = getRowSenderName(row);
+  if (senderName) {
+    recipientAvatar.dataset.autoProfilePictureSenderName = senderName;
+  }
+  const payloadForCache = {
+    identifier,
+    type: payloadType,
+    value: url,
+    color: initialsColor,
+  };
+  cacheRowAvatar(senderName, payloadForCache);
 
   if (
     shouldSkipAvatarUpdate(recipientAvatar, {
@@ -861,6 +1092,8 @@ async function installOnRow(document, urlOrObj, row, temporary) {
   ) {
     return false;
   }
+
+  let didUpdate = false;
 
   if (payloadType === "empty") {
     return false;
@@ -1443,6 +1676,7 @@ var headerApi = class extends ExtensionCommon.ExtensionAPI {
           const threadTree = window.threadTree;
 
           installCss(window);
+          initPermanentAvatarObserver(window);
 
           if (initials) {
             return handleInitials(window, payload, threadTree._rows, offset);
