@@ -51,48 +51,6 @@ class MessagesService {
   }
 
   /**
-   * Fetches avatars for the given messages.
-   * @param {Array} messages - The list of messages.
-   * @returns {Promise<Array>} - The list of avatar URLs.
-   */
-  async fetchAvatarsFromMessages(messages) {
-    const messagesAuthorsSet = await this.getMessagesAuthorsSet(messages);
-    const urls = {};
-
-    const avatarPromises = Array.from(messagesAuthorsSet).map(
-      async (author) => {
-        const identifier = author.getEmail() || author.getAuthor() || "";
-        const url = await this.avatarService.getAvatar(author);
-
-        if (url && typeof url === "object") {
-          urls[author] = {
-            value: url.value ?? "",
-            color: url.color ?? null,
-            identifier: url.identifier || identifier,
-          };
-          return;
-        }
-
-        if (url) {
-          urls[author] = {
-            value: url,
-            identifier,
-          };
-          return;
-        }
-
-        urls[author] = RecipientInitial.buildInitials(author);
-      },
-    );
-
-    await Promise.all(avatarPromises);
-
-    return this.mapMessagesToCorrespondents(messages).then((correspondents) => {
-      return correspondents.map((correspondent) => urls[correspondent]);
-    });
-  }
-
-  /**
    * Retrieves initials for the given messages.
    * @param {Array} messages - The list of messages.
    * @returns {Promise<Array<string>>} - The list of initials.
@@ -147,18 +105,75 @@ class MessagesService {
 
   /**
    * Displays avatars for the given messages.
+   *
+   * Each avatar is applied to its row as soon as it is fetched, so rows
+   * render progressively instead of waiting for every avatar of the batch.
    * @param {Array} messages - The list of messages.
    * @param {number} tabId - The tab ID.
    * @param {number} offset - The offset.
    * @param {Function} resolve - The resolve function for the promise.
    */
   async displayAvatars(messages, tabId, offset, resolve) {
-    const urls = await this.fetchAvatarsFromMessages(messages);
-    resolve();
+    let urlsArray = [];
+    try {
+      const correspondents = await this.mapMessagesToCorrespondents(messages);
+
+      const authorsByKey = new Map();
+      const rowOffsetsByAuthor = new Map();
+      correspondents.forEach((correspondent, index) => {
+        const key = correspondent.toString();
+        if (!authorsByKey.has(key)) {
+          authorsByKey.set(key, correspondent);
+        }
+        if (!rowOffsetsByAuthor.has(key)) {
+          rowOffsetsByAuthor.set(key, []);
+        }
+        rowOffsetsByAuthor.get(key).push(offset + index);
+      });
+
+      const urls = {};
+
+      const avatarPromises = Array.from(authorsByKey.entries()).map(
+        async ([authorKey, author]) => {
+          const identifier = author.getEmail() || author.getAuthor() || "";
+          const url = await this.avatarService.getAvatar(author);
+
+          let entry;
+          if (url && typeof url === "object") {
+            entry = {
+              value: url.value ?? "",
+              color: url.color ?? null,
+              identifier: url.identifier || identifier,
+            };
+          } else if (url) {
+            entry = { value: url, identifier };
+          } else {
+            entry = RecipientInitial.buildInitials(author);
+          }
+          urls[authorKey] = entry;
+
+          for (const rowOffset of rowOffsetsByAuthor.get(authorKey) || []) {
+            await browser.headerApi.installInboxAvatar(
+              tabId,
+              JSON.stringify(entry),
+              rowOffset,
+            );
+          }
+        },
+      );
+
+      await Promise.all(avatarPromises);
+
+      urlsArray = correspondents.map(
+        (correspondent) => urls[correspondent.toString()],
+      );
+    } finally {
+      resolve();
+    }
 
     const result = await browser.headerApi.pictureInboxList(
       tabId,
-      JSON.stringify(urls),
+      JSON.stringify(urlsArray),
       offset,
       false,
     );

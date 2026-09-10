@@ -1685,6 +1685,33 @@ var headerApi = class extends ExtensionCommon.ExtensionAPI {
           return handleInboxList(window, payload, threadTree, offset);
         },
         /**
+         * Installs a single avatar or initials on a specific row of the inbox list.
+         * Used for progressive loading: each row is updated as soon as its avatar
+         * is fetched, instead of waiting for the whole list to finish loading.
+         *
+         * @param {number} tabId - The tab ID.
+         * @param {string} urlJSON - The JSON string containing the avatar URL or initials.
+         * @param {number} offset - The offset of the row to update.
+         * @returns {Promise<Object>} - An object containing the status.
+         */
+        async installInboxAvatar(tabId, urlJSON = "{}", offset = 0) {
+          const payload = JSON.parse(urlJSON);
+          const { nativeTab } = context.extension.tabManager.get(tabId);
+          const window = getContentWindow(nativeTab);
+          const threadTree = window.threadTree;
+
+          installCss(window);
+          initPermanentAvatarObserver(window);
+
+          try {
+            await installInboxList(window, [payload], threadTree._rows, offset, false);
+            return { status: "success" };
+          } catch (error) {
+            console.error("Error installing inbox avatar:", error);
+            return { status: "failed", error };
+          }
+        },
+        /**
          * Gets the ID of the first displayed message in the thread tree.
          *
          * @param {number} tabId - The tab ID.

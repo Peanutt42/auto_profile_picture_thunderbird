@@ -64,6 +64,28 @@
         ]
       },
       {
+        "name": "installInboxAvatar",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {
+            "type": "integer",
+            "name": "tabId",
+            "optional": true
+          },
+          {
+            "type": "string",
+            "name": "url",
+            "optional": true
+          },
+          {
+            "type": "integer",
+            "name": "offset",
+            "optional": true
+          }
+        ]
+      },
+      {
         "name": "getFirstDisplayedMessageId",
         "type": "function",
         "async": true,
