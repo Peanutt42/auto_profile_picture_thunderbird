@@ -5,6 +5,7 @@ import CacheStorage from "./src/CacheStorage.js";
 import ContactsService from "./src/ContactsService.js";
 import MailService from "./src/MailService.js";
 import MessagesService from "./src/MessagesService.js";
+import RecipientInitial from "./src/RecipientInitial.js";
 
 const cache = new CacheStorage();
 const settingsManager = new SettingsManager(cache);
@@ -49,14 +50,70 @@ async function handleNeedData(tab, result) {
 
 /**
  * Displays avatars in a tab
+ *
+ * Uses a two-phase paint so the header never sits empty while the (possibly
+ * slow: contacts lookup, storage reads, network) avatar fetch runs:
+ * 1. Synchronously built initials are injected immediately (no I/O).
+ * 2. The fetched avatar is injected afterwards and upgrades the initials
+ *    in place (installOnMessageHeader replaces initials with the image).
+ * A per-tab token drops stale results when the user clicks through mails
+ * faster than fetches resolve.
  * @param {Object} tab Tab object
  * @param {Array} messages Array of message objects
  */
+const headerDisplayTokens = {};
 async function displayInTab(tab, messages) {
+  const token = (headerDisplayTokens[tab.id] =
+    (headerDisplayTokens[tab.id] || 0) + 1);
+
+  // Resolve correspondents once and reuse them for both phases so we don't
+  // pay the (possibly getFull-based) resolution cost twice.
+  let authors = [];
+  try {
+    authors = await Promise.all(
+      messages.map((message) =>
+        mailService.getCorrespondent(message, "messageHeader"),
+      ),
+    );
+  } catch (error) {
+    console.warn("Error resolving correspondents for header:", error);
+    return;
+  }
+  if (token !== headerDisplayTokens[tab.id]) {
+    return;
+  }
+
+  // Phase 1: instant initials paint (pure computation, no I/O).
+  try {
+    const initialsDict = {};
+    for (const author of authors) {
+      initialsDict[author.getEmail()] =
+        RecipientInitial.buildInitials(author);
+    }
+    // Dispatched first and intentionally not awaited: the upgrade in phase 2
+    // is sent over the same channel afterwards, preserving order.
+    browser.headerApi
+      .pictureHeaders(tab.id, JSON.stringify(initialsDict))
+      .catch((error) =>
+        console.warn("Error painting header initials:", error),
+      );
+  } catch (error) {
+    console.warn("Error painting header initials:", error);
+  }
+
+  // Phase 2: fetch real avatars (session/persistent cache or network) and
+  // upgrade the initials in place.
   let urlsDict = {};
-  for (const message of messages) {
-    const urls = await mailService.getUrl(message, "messageHeader");
-    urlsDict = { ...urlsDict, ...urls };
+  for (const author of authors) {
+    let url = await avatarService.getAvatar(author);
+    if (!url) {
+      url = RecipientInitial.buildInitials(author);
+    }
+    urlsDict[author.getEmail()] = url;
+  }
+  if (token !== headerDisplayTokens[tab.id]) {
+    // User already moved to another message; don't paint stale avatars.
+    return;
   }
   const urlDictJSON = JSON.stringify(urlsDict);
   const result = await browser.headerApi.pictureHeaders(tab.id, urlDictJSON);

@@ -2,10 +2,6 @@ import defaultSettings from "../settings/defaultSettings.js";
 import Author from "./Author.js";
 import ProfilePictureFetcher from "./ProfilePictureFetcher.js";
 
-const Status = {
-  WAITING: "[WAITING]",
-};
-
 /**
  * Service for managing avatar URLs.
  */
@@ -16,6 +12,12 @@ export default class AvatarService {
      * @type {Object.<string, string>}
      */
     this.sessionCacheAvatarUrls = {};
+    /**
+     * In-flight avatar fetches, keyed like the session cache. Concurrent
+     * callers share the same promise instead of polling.
+     * @type {Object.<string, Promise<string|null>>}
+     */
+    this.pendingAvatarFetches = {};
   }
 
   /**
@@ -23,13 +25,7 @@ export default class AvatarService {
    * @returns {number} - The number of avatars being fetched.
    */
   countWaitingAvatars() {
-    let waiting = 0;
-    for (const key in this.sessionCacheAvatarUrls) {
-      if (this.sessionCacheAvatarUrls[key] === Status.WAITING) {
-        waiting++;
-      }
-    }
-    return waiting;
+    return Object.keys(this.pendingAvatarFetches).length;
   }
 
   /**
@@ -37,11 +33,10 @@ export default class AvatarService {
    *
    * Steps:
    * 1. Check if the avatar URL is already in the session cache
-   * 2. If not in cache:
+   * 2. If a fetch for the author is already in flight, share its promise
+   * 3. Otherwise:
    *    a. Check if we're already processing too many requests
-   *    b. Store as waiting in the cache
-   *    c. Fetch and store the avatar URL in the cache
-   * 3. If the avatar is marked as waiting, poll until it's ready
+   *    b. Fetch and store the avatar URL in the cache
    * 4. Return the cached avatar URL
    *
    * @param {Author} author - The author for whom to fetch the avatar URL.
@@ -49,22 +44,33 @@ export default class AvatarService {
    */
   async getAvatar(author) {
     const lcAuthor = author.getAuthor().toLowerCase();
-    if (!this.sessionCacheAvatarUrls[lcAuthor]) {
-      if (this.countWaitingAvatars() > defaultSettings.MAX_REQUEST_SIZE) {
-        console.warn(
-          "Too many requests in progress, skipping avatar fetch for " +
-            author.getAuthor(),
+    if (this.sessionCacheAvatarUrls[lcAuthor]) {
+      return this.sessionCacheAvatarUrls[lcAuthor];
+    }
+    if (this.pendingAvatarFetches[lcAuthor]) {
+      return this.pendingAvatarFetches[lcAuthor];
+    }
+    if (this.countWaitingAvatars() > defaultSettings.MAX_REQUEST_SIZE) {
+      console.warn(
+        "Too many requests in progress, skipping avatar fetch for " +
+          author.getAuthor(),
+      );
+      return null;
+    }
+    const fetchPromise = (async () => {
+      try {
+        const profilePictureFetcher = new ProfilePictureFetcher(
+          window,
+          author,
         );
-        return null;
+        const url = await profilePictureFetcher.getAvatar();
+        this.sessionCacheAvatarUrls[lcAuthor] = url;
+        return url;
+      } finally {
+        delete this.pendingAvatarFetches[lcAuthor];
       }
-      this.sessionCacheAvatarUrls[lcAuthor] = Status.WAITING;
-      const profilePictureFetcher = new ProfilePictureFetcher(window, author);
-      this.sessionCacheAvatarUrls[lcAuthor] =
-        await profilePictureFetcher.getAvatar();
-    }
-    while (this.sessionCacheAvatarUrls[lcAuthor] === Status.WAITING) {
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-    return this.sessionCacheAvatarUrls[lcAuthor];
+    })();
+    this.pendingAvatarFetches[lcAuthor] = fetchPromise;
+    return fetchPromise;
   }
 }
